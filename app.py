@@ -67,6 +67,10 @@ def subsidy_at(h):
 with st.sidebar:
     st.header("Forecast Settings")
 
+    # --- Auto Date Range - Start date to today and End date in four years time. ---
+    today = datetime.today().date()
+    four_years_later = today + timedelta(days=4*365)
+
     # initialise theme in session
     if THEME_KEY not in st.session_state:
         st.session_state[THEME_KEY] = SESSION_STATE_LIGHT
@@ -79,8 +83,8 @@ with st.sidebar:
     )
 
     # inputs
-    start_date = st.date_input("Start Date", datetime(2026, 1, 1))
-    end_date   = st.date_input("End Date", datetime(2030, 12, 31))
+    start_date = st.date_input("Start Date", today)
+    end_date   = st.date_input("End Date", four_years_later)
     hashrate_growth = st.slider("Hashrate Growth (%/yr)", 10, 150, 50) / 100
     fee_growth      = st.slider("Fee Growth (%/yr)", -20, 100, 20) / 100
     price_model = st.selectbox("Price Model", ["Stock-to-Flow", "Power-Law", "Custom"])
