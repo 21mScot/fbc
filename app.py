@@ -16,11 +16,14 @@ HALVING = 210_000
 FEE_API = "https://mempool.space/api/v1/blocks"
 PRICE_API = "https://blockchain.info/ticker"
 EARLIEST_DATA = datetime(2017, 8, 17).date()
+
+# how much of the chart should be history vs forecast
 HISTORY_RATIO = 0.85   # show ~85% history and 15% forecast
 
 st.set_page_config(page_title="Future Bitcoin Calculator", layout="wide")
 st.title("Future Bitcoin Calculator")
 st.markdown("Forecast **mining rewards**, **fees**, **price**, and **network growth**.")
+
 
 # ========================================
 # HELPERS
@@ -300,31 +303,31 @@ if price_model == "Custom":
 # ========================================
 # DISPLAY METRICS
 # ========================================
-col1, col2, col3 = st.columns(3)
-with col1:
+c1, c2, c3 = st.columns(3)
+with c1:
     st.metric("Total BTC Mined", f"{total_btc:,.1f}")
-with col2:
+with c2:
     st.metric("Subsidy", f"{subsidy_btc:,.1f} BTC")
-with col3:
+with c3:
     st.metric("Fees", f"{fees_btc:,.1f} BTC")
 
-col4, col5 = st.columns(2)
-with col4:
+c4, c5 = st.columns(2)
+with c4:
     st.metric("Avg Fee per Block", f"{avg_fee_forecast:.4f} BTC")
-with col5:
+with c5:
     st.metric("Value at Current Price", f"${usd_value:,.0f}")
 
 # ========================================
-# PRICE CHART (with 90% history / 10% forecast trim)
+# PRICE CHART (with HISTORY_RATIO trim)
 # ========================================
 fig = go.Figure()
 dark = st.session_state.get("dark_mode", False)
 template = "plotly_dark" if dark else "plotly_white"
 
-today_dt = pd.Timestamp.today().normalize()
+today_ts = pd.Timestamp.today().normalize()  # real timestamp
 mc_df = None
 
-# --- build a trimmed version for the chart only ---
+# make a trimmed copy just for the chart
 plot_df_trim = plot_df.copy()
 forecast_cutoff = None
 
@@ -333,12 +336,13 @@ if backcast and history_mask.any():
     hist_start = plot_df_trim.loc[history_mask, "Date"].min()
     hist_end = plot_df_trim.loc[history_mask, "Date"].max()
     hist_days = max((hist_end - hist_start).days, 1)
-    max_forecast_days = int(hist_days * (1-HISTORY_RATIO))  # 10% of history length
+    forecast_share = 1 - HISTORY_RATIO  # e.g. 0.15
+    max_forecast_days = int(hist_days * forecast_share)
     forecast_cutoff = hist_end + pd.Timedelta(days=max_forecast_days)
     plot_df_trim = plot_df_trim[plot_df_trim["Date"] <= forecast_cutoff]
 
 if price_model == "Monte Carlo (GBM)":
-    # actuals first
+    # actuals solid
     hist_part = plot_df_trim[plot_df_trim["Actual Price"].notna()]
     if not hist_part.empty:
         fig.add_trace(
@@ -361,7 +365,7 @@ if price_model == "Monte Carlo (GBM)":
         n_sims=500,
     )
 
-    # trim MC too, if we calculated cutoff
+    # trim MC as well
     if forecast_cutoff is not None:
         mc_df = mc_df[pd.to_datetime(mc_df["Date"]) <= forecast_cutoff]
 
@@ -411,8 +415,8 @@ else:
             )
         )
 
-    # forecast dashed (from trimmed df)
-    future_mask = plot_df_trim["Date"].dt.normalize() > today_dt
+    # forecast dashed
+    future_mask = plot_df_trim["Date"].dt.normalize() > today_ts
     future_part = plot_df_trim[future_mask]
     if not future_part.empty:
         fig.add_trace(
@@ -425,14 +429,27 @@ else:
             )
         )
 
-# today line only when backcast is on and today is in trimmed data
-if backcast and (plot_df_trim["Date"].dt.normalize() == today_dt).any():
-    fig.add_vline(
-        x=today_dt.to_pydatetime(),
-        line=dict(color="gray", dash="dot"),
-        annotation_text="Today",
-        annotation_position="top left",
-    )
+# ✅ TODAY LINE — use shape + annotation (no add_vline → no summing error)
+fig.add_shape(
+    type="line",
+    x0=today_ts,
+    x1=today_ts,
+    y0=0,
+    y1=1,
+    xref="x",
+    yref="paper",
+    line=dict(color="gray", dash="dot"),
+)
+fig.add_annotation(
+    x=today_ts,
+    y=1,
+    xref="x",
+    yref="paper",
+    text="Today",
+    showarrow=False,
+    yshift=10,
+    font=dict(color="gray"),
+)
 
 fig.update_layout(
     title="Bitcoin Price Forecast",
@@ -440,11 +457,12 @@ fig.update_layout(
     yaxis_title="Price (USD)",
     hovermode="x unified",
     template=template,
-    height=650,  # 👈 increase height for a taller chart
+    height=600,
     margin=dict(l=80, r=40, t=60, b=60),
 )
 
-st.plotly_chart(fig, use_container_width=True)
+# new API
+st.plotly_chart(fig, width="stretch")
 
 # ========================================
 # MONTHLY TABLE (full horizon)
@@ -485,7 +503,7 @@ st.dataframe(
         "Est. Fee": "{:.6f}",
         "Price": "${:,.0f}",
     }),
-    use_container_width=True,
+    width="stretch",  # <- replaced use_container_width here too
 )
 
 csv = df_monthly.to_csv(index=False).encode()
@@ -496,10 +514,10 @@ st.download_button("Download CSV", csv, "future_bitcoin_forecast.csv", "text/csv
 # ========================================
 st.markdown("---")
 price_str = f"${current_price:,} USD"
-c1, c2, c3 = st.columns([2, 2, 1])
-with c1:
+col1, col2, col3 = st.columns([2, 2, 1])
+with col1:
     st.caption(f"**Data:** mempool.space • blockchain.info • **Price:** {price_str}")
-with c2:
+with col2:
     st.caption("Block time: **588 s** • Halving: **210 000** blocks")
-with c3:
+with col3:
     st.caption(f"Updated: **{datetime.now():%Y-%m-%d %H:%M}**")
