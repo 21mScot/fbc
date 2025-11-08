@@ -1,2 +1,2 @@
 # fbc
-A POSS Bicoin mining &amp; price forecasting tool
+A FOSS Bicoin mining &amp; price forecasting tool
