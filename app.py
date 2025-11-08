@@ -1,4 +1,4 @@
-# app.py — Future Bitcoin Calculator (Streamlit) with Monte Carlo + backcast styling
+# app.py — Future Bitcoin Calculator (Streamlit)
 import streamlit as st
 import requests
 import pandas as pd
@@ -16,17 +16,18 @@ HALVING = 210_000
 FEE_API = "https://mempool.space/api/v1/blocks"
 PRICE_API = "https://blockchain.info/ticker"
 EARLIEST_DATA = datetime(2017, 8, 17).date()
+HISTORY_RATIO = 0.85   # show ~85% history and 15% forecast
 
 st.set_page_config(page_title="Future Bitcoin Calculator", layout="wide")
 st.title("Future Bitcoin Calculator")
 st.markdown("Forecast **mining rewards**, **fees**, **price**, and **network growth**.")
-
 
 # ========================================
 # HELPERS
 # ========================================
 @st.cache_data
 def get_historical_prices() -> pd.DataFrame:
+    """Load historical BTC daily price CSV if available."""
     try:
         df = pd.read_csv("data/BTCUSD_daily.csv", skiprows=1)
         df["date"] = pd.to_datetime(df["Date"]).dt.date
@@ -71,10 +72,12 @@ def date_from_block(height: int) -> datetime:
 
 
 def power_law_price(days_since_genesis: int) -> float:
+    # crude descriptive model — we’ll re-scale it later
     return 0.00002 * (days_since_genesis ** 5.8)
 
 
 def build_price_series(start_date: datetime, end_date: datetime, backcast: bool) -> pd.DataFrame:
+    """Monthly-ish model series from start → end."""
     genesis = GENESIS
     today = datetime.today().date()
 
@@ -260,7 +263,7 @@ current_price = get_current_price()
 usd_value = total_btc * current_price
 
 # ========================================
-# BUILD BASE PRICE SERIES (for non-MC models)
+# BUILD BASE PRICE SERIES
 # ========================================
 model_df = build_price_series(start_dt, end_dt, backcast=backcast)
 hist_df = get_historical_prices()
@@ -273,7 +276,7 @@ else:
     plot_df = model_df.copy()
     plot_df["Actual Price"] = np.nan
 
-# --- re-scale model to last actual price to keep y-axis meaningful
+# re-scale model to last actual price to keep y-axis meaningful
 if backcast and not hist_df.empty and "price" in hist_df.columns:
     try:
         last_actual_date = hist_df["date"].max()
@@ -297,22 +300,22 @@ if price_model == "Custom":
 # ========================================
 # DISPLAY METRICS
 # ========================================
-c1, c2, c3 = st.columns(3)
-with c1:
+col1, col2, col3 = st.columns(3)
+with col1:
     st.metric("Total BTC Mined", f"{total_btc:,.1f}")
-with c2:
+with col2:
     st.metric("Subsidy", f"{subsidy_btc:,.1f} BTC")
-with c3:
+with col3:
     st.metric("Fees", f"{fees_btc:,.1f} BTC")
 
-c4, c5 = st.columns(2)
-with c4:
+col4, col5 = st.columns(2)
+with col4:
     st.metric("Avg Fee per Block", f"{avg_fee_forecast:.4f} BTC")
-with c5:
+with col5:
     st.metric("Value at Current Price", f"${usd_value:,.0f}")
 
 # ========================================
-# PRICE CHART
+# PRICE CHART (with 90% history / 10% forecast trim)
 # ========================================
 fig = go.Figure()
 dark = st.session_state.get("dark_mode", False)
@@ -321,9 +324,22 @@ template = "plotly_dark" if dark else "plotly_white"
 today_dt = pd.Timestamp.today().normalize()
 mc_df = None
 
+# --- build a trimmed version for the chart only ---
+plot_df_trim = plot_df.copy()
+forecast_cutoff = None
+
+history_mask = plot_df_trim["Actual Price"].notna()
+if backcast and history_mask.any():
+    hist_start = plot_df_trim.loc[history_mask, "Date"].min()
+    hist_end = plot_df_trim.loc[history_mask, "Date"].max()
+    hist_days = max((hist_end - hist_start).days, 1)
+    max_forecast_days = int(hist_days * (1-HISTORY_RATIO))  # 10% of history length
+    forecast_cutoff = hist_end + pd.Timedelta(days=max_forecast_days)
+    plot_df_trim = plot_df_trim[plot_df_trim["Date"] <= forecast_cutoff]
+
 if price_model == "Monte Carlo (GBM)":
-    # actuals
-    hist_part = plot_df[plot_df["Actual Price"].notna()]
+    # actuals first
+    hist_part = plot_df_trim[plot_df_trim["Actual Price"].notna()]
     if not hist_part.empty:
         fig.add_trace(
             go.Scatter(
@@ -344,6 +360,10 @@ if price_model == "Monte Carlo (GBM)":
         sigma=daily_sigma,
         n_sims=500,
     )
+
+    # trim MC too, if we calculated cutoff
+    if forecast_cutoff is not None:
+        mc_df = mc_df[pd.to_datetime(mc_df["Date"]) <= forecast_cutoff]
 
     fig.add_trace(go.Scatter(x=mc_df["Date"], y=mc_df["P95"], line=dict(width=0), showlegend=False))
     fig.add_trace(
@@ -378,8 +398,8 @@ if price_model == "Monte Carlo (GBM)":
     )
 
 else:
-    # non-MC
-    hist_part = plot_df[plot_df["Actual Price"].notna()]
+    # non-MC: actuals solid
+    hist_part = plot_df_trim[plot_df_trim["Actual Price"].notna()]
     if not hist_part.empty:
         fig.add_trace(
             go.Scatter(
@@ -391,8 +411,9 @@ else:
             )
         )
 
-    future_mask = plot_df["Date"].dt.normalize() > today_dt
-    future_part = plot_df[future_mask]
+    # forecast dashed (from trimmed df)
+    future_mask = plot_df_trim["Date"].dt.normalize() > today_dt
+    future_part = plot_df_trim[future_mask]
     if not future_part.empty:
         fig.add_trace(
             go.Scatter(
@@ -403,19 +424,9 @@ else:
                 line=dict(color="#f7931a", width=2, dash="dash"),
             )
         )
-    else:
-        fig.add_trace(
-            go.Scatter(
-                x=plot_df["Date"],
-                y=plot_df["Model Price"],
-                name="Forecast",
-                mode="lines",
-                line=dict(color="#f7931a", width=2, dash="dash"),
-            )
-        )
 
-# ✅ today line: only when backcast is on AND today exists in data
-if backcast and (plot_df["Date"].dt.normalize() == today_dt).any():
+# today line only when backcast is on and today is in trimmed data
+if backcast and (plot_df_trim["Date"].dt.normalize() == today_dt).any():
     fig.add_vline(
         x=today_dt.to_pydatetime(),
         line=dict(color="gray", dash="dot"),
@@ -429,11 +440,14 @@ fig.update_layout(
     yaxis_title="Price (USD)",
     hovermode="x unified",
     template=template,
+    height=650,  # 👈 increase height for a taller chart
+    margin=dict(l=80, r=40, t=60, b=60),
 )
-st.plotly_chart(fig, width='stretch')
+
+st.plotly_chart(fig, use_container_width=True)
 
 # ========================================
-# MONTHLY TABLE
+# MONTHLY TABLE (full horizon)
 # ========================================
 st.subheader("Monthly Breakdown")
 monthly = []
@@ -443,7 +457,7 @@ while cur <= end_dt:
     h = block_from_date(cur)
 
     if price_model == "Monte Carlo (GBM)" and mc_df is not None:
-        mc_row = mc_df[mc_df["Date"] == cur]
+        mc_row = mc_df[pd.to_datetime(mc_df["Date"]) == cur]
         if not mc_row.empty:
             price_val = float(mc_row["P50"].values[0])
         else:
@@ -471,7 +485,7 @@ st.dataframe(
         "Est. Fee": "{:.6f}",
         "Price": "${:,.0f}",
     }),
-    width='stretch',
+    use_container_width=True,
 )
 
 csv = df_monthly.to_csv(index=False).encode()
@@ -482,10 +496,10 @@ st.download_button("Download CSV", csv, "future_bitcoin_forecast.csv", "text/csv
 # ========================================
 st.markdown("---")
 price_str = f"${current_price:,} USD"
-col1, col2, col3 = st.columns([2, 2, 1])
-with col1:
+c1, c2, c3 = st.columns([2, 2, 1])
+with c1:
     st.caption(f"**Data:** mempool.space • blockchain.info • **Price:** {price_str}")
-with col2:
+with c2:
     st.caption("Block time: **588 s** • Halving: **210 000** blocks")
-with col3:
+with c3:
     st.caption(f"Updated: **{datetime.now():%Y-%m-%d %H:%M}**")
