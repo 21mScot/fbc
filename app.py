@@ -3,7 +3,7 @@ import streamlit as st
 import requests
 import pandas as pd
 import plotly.graph_objects as go
-from datetime import datetime, timedelta
+from datetime import datetime, date, timedelta
 import numpy as np
 
 # ========================================
@@ -16,6 +16,15 @@ HALVING = 210_000
 FEE_API = "https://mempool.space/api/v1/blocks"
 PRICE_API = "https://blockchain.info/ticker"
 EARLIEST_DATA = datetime(2017, 8, 17).date()
+NUMBER_DAYS_SEPARATION_BTWN_DATES = 180
+
+# date bounds for historical CSV
+EARLIEST_FROM_DATE = date(2017, 7, 1)     # 1 July 2017
+LATEST_FROM_DATE   = date(2025, 10, 1)    # 1 October 2025
+
+EARLIEST_TO_DATE   = date(2018, 1, 1)     # 1 January 2018
+LATEST_TO_DATE     = date(2025, 11, 1)    # 1 November 2025
+
 
 # how much of the chart should be history vs forecast
 HISTORY_RATIO = 0.85   # show ~85% history and 15% forecast
@@ -66,8 +75,14 @@ def subsidy_at(h: int) -> float:
     return 50 / (2 ** (h // HALVING))
 
 
-def block_from_date(date: datetime) -> int:
-    return int((date - GENESIS).total_seconds() / BLOCK_TIME)
+def block_from_date(date_input) -> int:
+    """Convert date/datetime to block height. Handles both date and datetime inputs."""
+    if isinstance(date_input, datetime):
+        dt = date_input
+    else:
+        # Convert date to datetime at start of day
+        dt = datetime.combine(date_input, datetime.min.time())
+    return int((dt - GENESIS).total_seconds() / BLOCK_TIME)
 
 
 def date_from_block(height: int) -> datetime:
@@ -164,36 +179,167 @@ def estimate_mu_sigma_from_history(hist_df: pd.DataFrame) -> tuple[float, float]
 # ========================================
 # SIDEBAR
 # ========================================
-with st.sidebar:
-    st.header("Forecast Settings")
-    st.toggle("Dark Mode", value=False, key="dark_mode")
 
-    backcast = st.checkbox(
-        "Show Backcast (max 8 years, from 2017-08-17)",
-        value=True,
+# --- SIDEBAR --------------------------------------------------------
+with st.sidebar:
+    st.header("Data mode")
+
+    # Historical first (your request)
+    mode = st.radio(
+        "Select data mode",
+        ["Historical", "Forecast"],
+        index=0,
+        help="Work with past (CSV) data or future projections.",
     )
 
     today = datetime.today().date()
     four_years = today + timedelta(days=4 * 365)
 
-    start_date = st.date_input("Start Date", value=today, min_value=today)
-    end_date = st.date_input("End Date", value=four_years, min_value=today)
+    # ========== HISTORICAL ==========
+    st.markdown("### Historical data inputs")
+    hist_disabled = mode != "Historical"
 
-    hashrate_growth = st.slider("Hashrate Growth (%/yr)", 10, 150, 50) / 100
-    fee_growth = st.slider("Fee Growth (%/yr)", -20, 100, 20) / 100
-
-    price_model = st.selectbox(
-        "Price Model",
-        [
-            "Power-Law",
-            "Stock-to-Flow (placeholder)",
-            "Monte Carlo (GBM)",
-            "Custom",
-        ],
-        index=0,
+    # 1) FROM date
+    hist_from = st.date_input(
+        "Historical from date",
+        value=EARLIEST_FROM_DATE,
+        min_value=EARLIEST_FROM_DATE,
+        max_value=LATEST_FROM_DATE,
+        disabled=hist_disabled,
+        key="hist_from",
     )
-    if price_model == "Custom":
-        custom_price = st.number_input("Custom Price (USD)", 50_000, 5_000_000, 250_000)
+
+    # compute the earliest valid "to" date:
+    # - must be at least EARLIEST_TO_DATE
+    # - must be at least (from date + separation)
+    min_to_by_separation = hist_from + timedelta(days=NUMBER_DAYS_SEPARATION_BTWN_DATES)
+    hist_to_min = max(EARLIEST_TO_DATE, min_to_by_separation)
+
+    hist_to = st.date_input(
+        "Historical to date",
+        value=LATEST_TO_DATE,
+        min_value=hist_to_min,
+        max_value=LATEST_TO_DATE,
+        disabled=hist_disabled,
+        key="hist_to",
+    )
+
+    # make sure the range is sensible
+    # if hist_from > hist_to:
+    #    # simplest fix: snap the 'to' date to the 'from' date (within allowed range)
+    #    hist_to = hist_from
+
+
+    st.caption("Source: data/BTCUSD_daily.csv NB Minimum " + str(NUMBER_DAYS_SEPARATION_BTWN_DATES) + " days between Historic from/to dates.")
+
+    st.markdown("---")
+
+    # ========== FORECAST ==========
+    st.markdown("### Forecast data inputs")
+    forecast_disabled = mode != "Forecast"
+
+    forecast_start = st.date_input(
+        "Forecast start date",
+        value=today,
+        min_value=today,
+        disabled=forecast_disabled,
+        key="forecast_start",
+    )
+
+    forecast_end = st.date_input(
+        "Forecast end date",
+        value=four_years,
+        min_value=today,
+        disabled=forecast_disabled,
+        key="forecast_end",
+    )
+
+    # keep/restore other forecast inputs your app already had
+    fee_growth = st.slider(
+        "Fee growth (%/yr)",
+        min_value=0,
+        max_value=100,
+        value=5,
+        disabled=forecast_disabled,
+        key="fee_growth",
+    )
+
+    # price settings – these were showing as undefined in your screenshot
+    st.markdown("### Price")
+    price_model = st.selectbox(
+        "BTC price model",
+        ["Spot/auto", "Custom"],
+        index=0,
+        disabled=(mode == "Historical"),  # historical uses CSV
+        key="price_model",
+    )
+
+    custom_price = st.number_input(
+        "Custom BTC price (USD)",
+        min_value=0.0,
+        value=60000.0,
+        step=100.0,
+        disabled=(mode == "Historical" or price_model != "Custom"),
+        key="custom_price",
+    )
+# --- END SIDEBAR ----------------------------------------------------
+
+# -------------------------------------------------
+# normalise dates coming from the sidebar
+# -------------------------------------------------
+
+# --- after sidebar + after you read hist_from / hist_to etc. ---
+
+# immediately normalise bad user selections
+if mode == "Historical":
+    min_allowed_to = max(
+        EARLIEST_TO_DATE,
+        hist_from + timedelta(days=NUMBER_DAYS_SEPARATION_BTWN_DATES),
+    )
+
+    if hist_to < min_allowed_to:
+        # hard fail: user picked an invalid pair
+        st.error(
+            f"Your historical ‘to’ date must be at least "
+            f"{NUMBER_DAYS_SEPARATION_BTWN_DATES} days after the ‘from’ date. "
+            f"Try {min_allowed_to.isoformat()} or later."
+        )
+        st.stop()
+
+    date_error = None   
+
+if mode == "Historical":
+    # user must pick a to-date that is >= from-date
+    if hist_to < hist_from:
+        date_error = (
+            "Your historical **to** date is earlier than your **from** date. "
+            "Please pick a later 'to' date."
+        )
+
+elif mode == "Forecast":
+    if forecast_end < forecast_start:
+        date_error = (
+            "Your forecast **end** date is earlier than your **start** date. "
+            "Please pick a later end date."
+        )
+
+if date_error:
+    st.error(date_error)
+    st.stop()
+
+if mode == "Forecast":
+    active_start_date = forecast_start
+    active_end_date = forecast_end
+else:
+    active_start_date = hist_from
+    active_end_date = hist_to
+
+# convert date -> datetime so functions like block_from_date() don't fail
+start_dt = datetime.combine(active_start_date, datetime.min.time())
+end_dt = datetime.combine(active_end_date, datetime.min.time())
+
+# keep legacy flag your lower code uses
+backcast = (mode == "Historical")
 
 # ========================================
 # THEME (DARK / LIGHT) VIA CSS
@@ -244,11 +390,27 @@ else:
 # ========================================
 # CALCULATIONS (mining side)
 # ========================================
-start_dt = datetime.combine(start_date, datetime.min.time())
-end_dt = datetime.combine(end_date, datetime.min.time())
+# start_dt = datetime.combine(active_start_date, datetime.min.time())
+# end_dt = datetime.combine(active_end_date, datetime.min.time())
 
-h1 = block_from_date(start_dt)
-h2 = block_from_date(end_dt)
+# pick the active date range based on mode
+if mode == "Forecast":
+    active_start_date = forecast_start
+    active_end_date = forecast_end
+else:
+    active_start_date = hist_from
+    active_end_date = hist_to
+
+# --- compatibility with older code further down ---
+start_date = active_start_date
+end_date = active_end_date
+backcast = (mode == "Historical")
+
+# some parts of the app seem to use fee_growth/free_growth interchangeably
+free_growth = fee_growth
+
+h1 = block_from_date(start_date)
+h2 = block_from_date(end_date)
 blocks = h2 - h1 + 1
 era1, era2 = h1 // HALVING, h2 // HALVING
 if era1 == era2:
@@ -257,7 +419,7 @@ else:
     subsidy_btc = sum(subsidy_at(h) for h in range(h1, h2 + 1))
 
 current_fee = get_avg_fee_btc()
-years = (end_dt - start_dt).days / 365.25
+years = (start_date - end_date).days / 365.25
 avg_fee_forecast = current_fee * ((1 + fee_growth) ** (years / 2))
 fees_btc = blocks * avg_fee_forecast
 total_btc = subsidy_btc + fees_btc
@@ -320,6 +482,9 @@ with c5:
 # ========================================
 # PRICE CHART (with HISTORY_RATIO trim)
 # ========================================
+# ========================================
+# PRICE CHART (with HISTORY_RATIO trim)
+# ========================================
 fig = go.Figure()
 dark = st.session_state.get("dark_mode", False)
 template = "plotly_dark" if dark else "plotly_white"
@@ -327,8 +492,21 @@ template = "plotly_dark" if dark else "plotly_white"
 today_ts = pd.Timestamp.today().normalize()  # real timestamp
 mc_df = None
 
+# 🔒 make sure bounds are pandas Timestamps
+start_ts = pd.to_datetime(start_date)
+end_ts = pd.to_datetime(end_date)
+
+# also make sure the Date column is datetime
+plot_df["Date"] = pd.to_datetime(plot_df["Date"])
+
+
+# ✅ use the user-selected window
+plot_df_window = plot_df[
+    (plot_df["Date"] >= start_ts) & (plot_df["Date"] <= end_ts)
+].copy()
+
 # make a trimmed copy just for the chart
-plot_df_trim = plot_df.copy()
+plot_df_trim = plot_df_window.copy()
 forecast_cutoff = None
 
 history_mask = plot_df_trim["Actual Price"].notna()
@@ -358,8 +536,8 @@ if price_model == "Monte Carlo (GBM)":
     daily_mu, daily_sigma = estimate_mu_sigma_from_history(hist_df)
     mc_df = monte_carlo_gbm(
         start_price=current_price,
-        start_dt=start_dt,
-        end_dt=end_dt,
+        start_dt=start_ts,   # ✅ use timestamp version
+        end_dt=end_ts,       # ✅ use timestamp version
         mu=daily_mu,
         sigma=daily_sigma,
         n_sims=500,
@@ -429,39 +607,42 @@ else:
             )
         )
 
-# ✅ TODAY LINE — use shape + annotation (no add_vline → no summing error)
-fig.add_shape(
-    type="line",
-    x0=today_ts,
-    x1=today_ts,
-    y0=0,
-    y1=1,
-    xref="x",
-    yref="paper",
-    line=dict(color="gray", dash="dot"),
-)
-fig.add_annotation(
-    x=today_ts,
-    y=1,
-    xref="x",
-    yref="paper",
-    text="Today",
-    showarrow=False,
-    yshift=10,
-    font=dict(color="gray"),
-)
+# ✅ TODAY LINE — only if today is inside the selected window
+if start_ts <= today_ts <= end_ts:
+    fig.add_shape(
+        type="line",
+        x0=today_ts,
+        x1=today_ts,
+        y0=0,
+        y1=1,
+        xref="x",
+        yref="paper",
+        line=dict(color="gray", dash="dot"),
+    )
+    fig.add_annotation(
+        x=today_ts,
+        y=1,
+        xref="x",
+        yref="paper",
+        text="Today",
+        showarrow=False,
+        yshift=10,
+        font=dict(color="gray"),
+    )
+# -----------------------------------------------
 
 fig.update_layout(
-    title="Bitcoin Price Forecast",
+    title="Bitcoin Price Actual / Forecast",
     xaxis_title="Date",
     yaxis_title="Price (USD)",
     hovermode="x unified",
     template=template,
     height=600,
     margin=dict(l=80, r=40, t=60, b=60),
+    xaxis=dict(range=[start_ts, end_ts]),  # 👈 force start/end to user's dates
 )
 
-# new API
+
 st.plotly_chart(fig, width="stretch")
 
 # ========================================
