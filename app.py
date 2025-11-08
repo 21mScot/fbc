@@ -1,4 +1,4 @@
-# app.py — Future Bitcoin Calculator (Streamlit)
+# app.py — Future Bitcoin Calculator (Streamlit) with Monte Carlo + backcast styling
 import streamlit as st
 import requests
 import pandas as pd
@@ -15,12 +15,12 @@ SATOSHIS = 100_000_000
 HALVING = 210_000
 FEE_API = "https://mempool.space/api/v1/blocks"
 PRICE_API = "https://blockchain.info/ticker"
-
 EARLIEST_DATA = datetime(2017, 8, 17).date()
 
 st.set_page_config(page_title="Future Bitcoin Calculator", layout="wide")
 st.title("Future Bitcoin Calculator")
 st.markdown("Forecast **mining rewards**, **fees**, **price**, and **network growth**.")
+
 
 # ========================================
 # HELPERS
@@ -33,8 +33,7 @@ def get_historical_prices() -> pd.DataFrame:
         df = df[["date", "Close"]].rename(columns={"Close": "price"})
         df = df.drop_duplicates("date").sort_values("date").reset_index(drop=True)
         return df
-    except Exception as e:
-        st.error(f"Failed to load historical CSV: {e}")
+    except Exception:
         return pd.DataFrame()
 
 
@@ -54,36 +53,34 @@ def get_current_price() -> int:
     try:
         data = requests.get(PRICE_API, timeout=10).json()
         return int(data["USD"]["last"])
-    except Exception:
-        return 104_000
+    except Exception as e:
+        st.warning(f"Price fetch failed: {e} — using fallback 99321")
+        return 99321
 
 
-def block_from_date(dt: datetime) -> int:
-    return int((dt - GENESIS).total_seconds() / BLOCK_TIME)
+def subsidy_at(h: int) -> float:
+    return 50 / (2 ** (h // HALVING))
+
+
+def block_from_date(date: datetime) -> int:
+    return int((date - GENESIS).total_seconds() / BLOCK_TIME)
 
 
 def date_from_block(height: int) -> datetime:
     return GENESIS + timedelta(seconds=height * BLOCK_TIME)
 
 
-def subsidy_at(height: int) -> float:
-    return 50 / (2 ** (height // HALVING))
+def power_law_price(days_since_genesis: int) -> float:
+    return 0.00002 * (days_since_genesis ** 5.8)
 
 
-def power_law_price(days_since_genesis: float) -> float:
-    return 1.5e-8 * (days_since_genesis ** 3.3)
-
-
-def get_price_forecast_with_backcast(
-    start_date: datetime.date,
-    end_date: datetime.date,
-    backcast: bool,
-) -> pd.DataFrame:
+def build_price_series(start_date: datetime, end_date: datetime, backcast: bool) -> pd.DataFrame:
+    genesis = GENESIS
     today = datetime.today().date()
-    genesis = GENESIS.date()
 
     if backcast:
-        series_start = max(EARLIEST_DATA, today - timedelta(days=8 * 365))
+        series_start = min(start_date.date(), EARLIEST_DATA)
+        series_start = datetime.combine(series_start, datetime.min.time())
     else:
         series_start = start_date
 
@@ -101,15 +98,61 @@ def get_price_forecast_with_backcast(
         price = power_law_price(days)
         dates.append(cur)
         model_prices.append(price)
-        is_hist.append(cur <= today)
+        is_hist.append(cur.date() <= today)
         cur += timedelta(days=30)
 
     return pd.DataFrame({
-        # Return a datetime64[ns] Series so `.dt` accessor works downstream
-        "Date": pd.Series(pd.to_datetime(dates)),
+        "Date": pd.to_datetime(dates),
         "Model Price": model_prices,
         "Historical": is_hist,
     })
+
+
+def monte_carlo_gbm(start_price: float, start_dt: datetime, end_dt: datetime,
+                    mu: float, sigma: float, n_sims: int = 500) -> pd.DataFrame:
+    days = (end_dt - start_dt).days
+    if days <= 0:
+        days = 1
+
+    dates = [start_dt + timedelta(days=i) for i in range(days + 1)]
+    dt = 1 / 365
+
+    sims = np.zeros((len(dates), n_sims), dtype=float)
+    sims[0, :] = start_price
+
+    for t in range(1, len(dates)):
+        z = np.random.normal(size=n_sims)
+        sims[t, :] = sims[t - 1, :] * np.exp((mu - 0.5 * sigma ** 2) * dt + sigma * np.sqrt(dt) * z)
+
+    p5 = np.percentile(sims, 5, axis=1)
+    p25 = np.percentile(sims, 25, axis=1)
+    p50 = np.percentile(sims, 50, axis=1)
+    p75 = np.percentile(sims, 75, axis=1)
+    p95 = np.percentile(sims, 95, axis=1)
+
+    return pd.DataFrame({
+        "Date": dates,
+        "P05": p5,
+        "P25": p25,
+        "P50": p50,
+        "P75": p75,
+        "P95": p95,
+    })
+
+
+def estimate_mu_sigma_from_history(hist_df: pd.DataFrame) -> tuple[float, float]:
+    if hist_df is None or hist_df.empty:
+        annual_mu = 0.35
+        annual_sigma = 0.75
+        daily_mu = (1 + annual_mu) ** (1 / 365) - 1
+        daily_sigma = annual_sigma / np.sqrt(252)
+        return daily_mu, daily_sigma
+
+    prices = hist_df["price"].astype(float).values
+    returns = np.diff(np.log(prices))
+    daily_mu = returns.mean()
+    daily_sigma = returns.std()
+    return daily_mu, daily_sigma
 
 
 # ========================================
@@ -133,12 +176,67 @@ with st.sidebar:
     hashrate_growth = st.slider("Hashrate Growth (%/yr)", 10, 150, 50) / 100
     fee_growth = st.slider("Fee Growth (%/yr)", -20, 100, 20) / 100
 
-    price_model = st.selectbox("Price Model", ["Power-Law", "Stock-to-Flow", "Custom"], index=0)
+    price_model = st.selectbox(
+        "Price Model",
+        [
+            "Power-Law",
+            "Stock-to-Flow (placeholder)",
+            "Monte Carlo (GBM)",
+            "Custom",
+        ],
+        index=0,
+    )
     if price_model == "Custom":
         custom_price = st.number_input("Custom Price (USD)", 50_000, 5_000_000, 250_000)
 
 # ========================================
-# CALCULATIONS
+# THEME (DARK / LIGHT) VIA CSS
+# ========================================
+if st.session_state.get("dark_mode", False):
+    st.markdown(
+        """
+        <style>
+        .stApp, body {
+            background-color: #0e1117 !important;
+            color: #f7f7f7 !important;
+        }
+        [data-testid="stSidebar"],
+        section[data-testid="stSidebar"],
+        div[data-testid="stSidebar"] > div:first-child {
+            background-color: #141820 !important;
+            color: #f7f7f7 !important;
+        }
+        [data-testid="stSidebar"] * {
+            color: #f7f7f7 !important;
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+else:
+    st.markdown(
+        """
+        <style>
+        .stApp, body {
+            background-color: #ffffff !important;
+            color: #0e1117 !important;
+        }
+        [data-testid="stSidebar"],
+        section[data-testid="stSidebar"],
+        div[data-testid="stSidebar"] > div:first-child {
+            background-color: #f7f7f7 !important;
+            color: #0e1117 !important;
+        }
+        [data-testid="stSidebar"] * {
+            color: #0e1117 !important;
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+# ========================================
+# CALCULATIONS (mining side)
 # ========================================
 start_dt = datetime.combine(start_date, datetime.min.time())
 end_dt = datetime.combine(end_date, datetime.min.time())
@@ -146,7 +244,6 @@ end_dt = datetime.combine(end_date, datetime.min.time())
 h1 = block_from_date(start_dt)
 h2 = block_from_date(end_dt)
 blocks = h2 - h1 + 1
-
 era1, era2 = h1 // HALVING, h2 // HALVING
 if era1 == era2:
     subsidy_btc = blocks * subsidy_at(h1)
@@ -157,76 +254,183 @@ current_fee = get_avg_fee_btc()
 years = (end_dt - start_dt).days / 365.25
 avg_fee_forecast = current_fee * ((1 + fee_growth) ** (years / 2))
 fees_btc = blocks * avg_fee_forecast
-
 total_btc = subsidy_btc + fees_btc
+
 current_price = get_current_price()
 usd_value = total_btc * current_price
 
-model_df = get_price_forecast_with_backcast(start_date, end_date, backcast)
-
+# ========================================
+# BUILD BASE PRICE SERIES (for non-MC models)
+# ========================================
+model_df = build_price_series(start_dt, end_dt, backcast=backcast)
 hist_df = get_historical_prices()
-if not hist_df.empty:
-    hist_df["date"] = pd.to_datetime(hist_df["date"])  # ← Ensure datetime
+
+if backcast and not hist_df.empty:
+    hist_df["date"] = pd.to_datetime(hist_df["date"])
     plot_df = model_df.merge(hist_df, left_on="Date", right_on="date", how="left")
     plot_df["Actual Price"] = plot_df["price"]
 else:
     plot_df = model_df.copy()
     plot_df["Actual Price"] = np.nan
 
-# Keep Date as datetime64[ns] so `.dt` works; don't convert to pydatetime()
-plot_df["Date"] = pd.to_datetime(plot_df["Date"])
+# --- re-scale model to last actual price to keep y-axis meaningful
+if backcast and not hist_df.empty and "price" in hist_df.columns:
+    try:
+        last_actual_date = hist_df["date"].max()
+        last_actual_price = float(
+            hist_df.loc[hist_df["date"] == last_actual_date, "price"].iloc[0]
+        )
+        join_mask = plot_df["Date"] >= pd.to_datetime(last_actual_date)
+        if join_mask.any():
+            model_at_join = float(plot_df.loc[join_mask, "Model Price"].iloc[0])
+            if model_at_join > 0:
+                scale_factor = last_actual_price / model_at_join
+                plot_df["Model Price"] = plot_df["Model Price"] * scale_factor
+    except Exception as e:
+        st.warning(f"Model scaling skipped ({e})")
 
-# ---- BUILD FIGURE (fix: was missing) ----
+# custom model
+if price_model == "Custom":
+    first_model = plot_df["Model Price"].iloc[0]
+    plot_df["Model Price"] = plot_df["Model Price"] * (custom_price / first_model)
+
+# ========================================
+# DISPLAY METRICS
+# ========================================
+c1, c2, c3 = st.columns(3)
+with c1:
+    st.metric("Total BTC Mined", f"{total_btc:,.1f}")
+with c2:
+    st.metric("Subsidy", f"{subsidy_btc:,.1f} BTC")
+with c3:
+    st.metric("Fees", f"{fees_btc:,.1f} BTC")
+
+c4, c5 = st.columns(2)
+with c4:
+    st.metric("Avg Fee per Block", f"{avg_fee_forecast:.4f} BTC")
+with c5:
+    st.metric("Value at Current Price", f"${usd_value:,.0f}")
+
+# ========================================
+# PRICE CHART
+# ========================================
 fig = go.Figure()
-fig.add_trace(go.Scatter(
-    x=plot_df["Date"],
-    y=plot_df["Model Price"],
-    name="Model Price",
-    mode="lines",
-    line=dict(width=2),
-))
-fig.add_trace(go.Scatter(
-    x=plot_df["Date"],
-    y=plot_df["Actual Price"],
-    name="Actual Price",
-    mode="markers+lines",
-    marker=dict(size=6),
-    opacity=0.8,
-))
+dark = st.session_state.get("dark_mode", False)
+template = "plotly_dark" if dark else "plotly_white"
 
-# ---- 4. TODAY VERTICAL LINE ----
-today_dt = datetime.today().replace(hour=0, minute=0, second=0, microsecond=0)
-# Only add the "Today" vline/annotation when backcast is NOT shown
-if not backcast and plot_df["Date"].dt.date.isin([today_dt.date()]).any():
-    # pass the date as ISO string to avoid mixed-type arithmetic inside plotly internals
+today_dt = pd.Timestamp.today().normalize()
+mc_df = None
+
+if price_model == "Monte Carlo (GBM)":
+    # actuals
+    hist_part = plot_df[plot_df["Actual Price"].notna()]
+    if not hist_part.empty:
+        fig.add_trace(
+            go.Scatter(
+                x=hist_part["Date"],
+                y=hist_part["Actual Price"],
+                name="Actual Price",
+                mode="lines",
+                line=dict(color="#f7931a", width=2),
+            )
+        )
+
+    daily_mu, daily_sigma = estimate_mu_sigma_from_history(hist_df)
+    mc_df = monte_carlo_gbm(
+        start_price=current_price,
+        start_dt=start_dt,
+        end_dt=end_dt,
+        mu=daily_mu,
+        sigma=daily_sigma,
+        n_sims=500,
+    )
+
+    fig.add_trace(go.Scatter(x=mc_df["Date"], y=mc_df["P95"], line=dict(width=0), showlegend=False))
+    fig.add_trace(
+        go.Scatter(
+            x=mc_df["Date"],
+            y=mc_df["P05"],
+            fill="tonexty",
+            name="90% band",
+            opacity=0.15,
+            line=dict(width=0),
+        )
+    )
+    fig.add_trace(go.Scatter(x=mc_df["Date"], y=mc_df["P75"], line=dict(width=0), showlegend=False))
+    fig.add_trace(
+        go.Scatter(
+            x=mc_df["Date"],
+            y=mc_df["P25"],
+            fill="tonexty",
+            name="50% band",
+            opacity=0.25,
+            line=dict(width=0),
+        )
+    )
+    fig.add_trace(
+        go.Scatter(
+            x=mc_df["Date"],
+            y=mc_df["P50"],
+            name="Forecast (MC median)",
+            mode="lines",
+            line=dict(color="#f7931a", width=2, dash="dash"),
+        )
+    )
+
+else:
+    # non-MC
+    hist_part = plot_df[plot_df["Actual Price"].notna()]
+    if not hist_part.empty:
+        fig.add_trace(
+            go.Scatter(
+                x=hist_part["Date"],
+                y=hist_part["Actual Price"],
+                name="Actual Price",
+                mode="lines",
+                line=dict(color="#f7931a", width=2),
+            )
+        )
+
+    future_mask = plot_df["Date"].dt.normalize() > today_dt
+    future_part = plot_df[future_mask]
+    if not future_part.empty:
+        fig.add_trace(
+            go.Scatter(
+                x=future_part["Date"],
+                y=future_part["Model Price"],
+                name="Forecast",
+                mode="lines",
+                line=dict(color="#f7931a", width=2, dash="dash"),
+            )
+        )
+    else:
+        fig.add_trace(
+            go.Scatter(
+                x=plot_df["Date"],
+                y=plot_df["Model Price"],
+                name="Forecast",
+                mode="lines",
+                line=dict(color="#f7931a", width=2, dash="dash"),
+            )
+        )
+
+# ✅ today line: only when backcast is on AND today exists in data
+if backcast and (plot_df["Date"].dt.normalize() == today_dt).any():
     fig.add_vline(
-        x=today_dt.isoformat(),
-        line=dict(color="gray", dash="dash"),
-        opacity=0.6,
-    )
-    # add a separate annotation (avoids the shapeannotation computation that caused the error)
-    fig.add_annotation(
-        x=today_dt,
-        yref="paper",
-        y=1.02,
-        text="Today",
-        showarrow=False,
-        xanchor="left",
-        font=dict(color="gray"),
+        x=today_dt.to_pydatetime(),
+        line=dict(color="gray", dash="dot"),
+        annotation_text="Today",
+        annotation_position="top left",
     )
 
-# ---- 5. LAYOUT ----
 fig.update_layout(
-    title="Bitcoin Price: Backcast (Actual) • Model • Forecast",
+    title="Bitcoin Price Forecast",
     xaxis_title="Date",
     yaxis_title="Price (USD)",
     hovermode="x unified",
-    template="plotly_dark" if st.session_state.get("dark_mode", False) else "plotly_white",
-    legend=dict(yanchor="top", y=0.99, xanchor="left", x=0.01),
-    showlegend=True,
+    template=template,
 )
-
-st.plotly_chart(fig, width="stretch")
+st.plotly_chart(fig, width='stretch')
 
 # ========================================
 # MONTHLY TABLE
@@ -237,13 +441,25 @@ cur = start_dt
 price_idx = 0
 while cur <= end_dt:
     h = block_from_date(cur)
-    price = plot_df.iloc[min(price_idx, len(plot_df)-1)]["Model Price"]
+
+    if price_model == "Monte Carlo (GBM)" and mc_df is not None:
+        mc_row = mc_df[mc_df["Date"] == cur]
+        if not mc_row.empty:
+            price_val = float(mc_row["P50"].values[0])
+        else:
+            price_val = float(mc_df["P50"].iloc[-1])
+    else:
+        if price_idx < len(plot_df):
+            price_val = float(plot_df.iloc[price_idx]["Model Price"])
+        else:
+            price_val = float(plot_df.iloc[-1]["Model Price"])
+
     monthly.append({
         "Month": cur.strftime("%Y-%m"),
         "Block": h,
         "Subsidy": subsidy_at(h),
         "Est. Fee": current_fee * (1 + fee_growth) ** ((cur - start_dt).days / 365.25),
-        "Price": price,
+        "Price": price_val,
     })
     cur += timedelta(days=30)
     price_idx += 1
@@ -255,7 +471,7 @@ st.dataframe(
         "Est. Fee": "{:.6f}",
         "Price": "${:,.0f}",
     }),
-    width="stretch",
+    width='stretch',
 )
 
 csv = df_monthly.to_csv(index=False).encode()
