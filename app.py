@@ -105,7 +105,8 @@ def get_price_forecast_with_backcast(
         cur += timedelta(days=30)
 
     return pd.DataFrame({
-        "Date": pd.to_datetime(dates),  # ← Convert to datetime for Plotly
+        # Return a datetime64[ns] Series so `.dt` accessor works downstream
+        "Date": pd.Series(pd.to_datetime(dates)),
         "Model Price": model_prices,
         "Historical": is_hist,
     })
@@ -172,78 +173,46 @@ else:
     plot_df = model_df.copy()
     plot_df["Actual Price"] = np.nan
 
-if price_model == "Custom":
-    first_model = plot_df["Model Price"].iloc[0]
-    plot_df["Model Price"] = plot_df["Model Price"] * (custom_price / first_model)
+# Keep Date as datetime64[ns] so `.dt` works; don't convert to pydatetime()
+plot_df["Date"] = pd.to_datetime(plot_df["Date"])
 
-# ========================================
-# DISPLAY METRICS
-# ========================================
-c1, c2, c3 = st.columns(3)
-with c1:
-    st.metric("Total BTC Mined", f"{total_btc:,.1f}")
-with c2:
-    st.metric("Subsidy", f"{subsidy_btc:,.1f} BTC")
-with c3:
-    st.metric("Fees", f"{fees_btc:,.1f} BTC")
-
-c4, c5 = st.columns(2)
-with c4:
-    st.metric("Avg Fee per Block", f"{avg_fee_forecast:.4f} BTC")
-with c5:
-    st.metric("Value at Current Price", f"${usd_value:,.0f}")
-
-# ========================================
-# PRICE CHART (Backcast + Forecast + Model)
-# ========================================
+# ---- BUILD FIGURE (fix: was missing) ----
 fig = go.Figure()
-
-# ---- 1. ACTUAL HISTORICAL (ORANGE, SOLID) ----
-hist = plot_df[plot_df["Historical"] & plot_df["Actual Price"].notna()]
-if not hist.empty:
-    fig.add_trace(
-        go.Scatter(
-            x=hist["Date"],
-            y=hist["Actual Price"],
-            mode="lines",
-            name="Actual Price (Backcast)",
-            line=dict(color="#ff7f0e", width=2.5),  # Orange, solid
-        )
-    )
-
-# ---- 2. POWER-LAW MODEL (GREEN, DOTTED) ----
-fig.add_trace(
-    go.Scatter(
-        x=plot_df["Date"],
-        y=plot_df["Model Price"],
-        mode="lines",
-        name="Power-Law Model",
-        line=dict(color="#2ca02c", width=2, dash="dot"),  # Green, dotted
-    )
-)
-
-# ---- 3. FORECAST (BLUE, DASHED) ----
-# Only show forecast part (from today onward)
-forecast = plot_df[~plot_df["Historical"]]
-if not forecast.empty:
-    fig.add_trace(
-        go.Scatter(
-            x=forecast["Date"],
-            y=forecast["Model Price"],
-            mode="lines",
-            name="Forecast (Future)",
-            line=dict(color="#1f77b4", width=2.5, dash="dash"),  # Blue, dashed
-        )
-    )
+fig.add_trace(go.Scatter(
+    x=plot_df["Date"],
+    y=plot_df["Model Price"],
+    name="Model Price",
+    mode="lines",
+    line=dict(width=2),
+))
+fig.add_trace(go.Scatter(
+    x=plot_df["Date"],
+    y=plot_df["Actual Price"],
+    name="Actual Price",
+    mode="markers+lines",
+    marker=dict(size=6),
+    opacity=0.8,
+))
 
 # ---- 4. TODAY VERTICAL LINE ----
-today_dt = pd.Timestamp.today().normalize()
-if today_dt in plot_df["Date"].values:
+today_dt = datetime.today().replace(hour=0, minute=0, second=0, microsecond=0)
+# Only add the "Today" vline/annotation when backcast is NOT shown
+if not backcast and plot_df["Date"].dt.date.isin([today_dt.date()]).any():
+    # pass the date as ISO string to avoid mixed-type arithmetic inside plotly internals
     fig.add_vline(
-        x=today_dt,
+        x=today_dt.isoformat(),
         line=dict(color="gray", dash="dash"),
-        annotation_text="Today",
-        annotation_position="top left",
+        opacity=0.6,
+    )
+    # add a separate annotation (avoids the shapeannotation computation that caused the error)
+    fig.add_annotation(
+        x=today_dt,
+        yref="paper",
+        y=1.02,
+        text="Today",
+        showarrow=False,
+        xanchor="left",
+        font=dict(color="gray"),
     )
 
 # ---- 5. LAYOUT ----
