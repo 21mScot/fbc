@@ -29,4 +29,12 @@ HISTOGRAM_HEIGHT_RATIO = 0.6   # e.g. 0.8 = top bar reaches 80% of right axis
 HISTOGRAM_COLOR = "rgba(128,128,128,0.5)"  # semi-transparent light grey
 
 # Controls how opaque the histogram bars are (0 = fully transparent, 1 = solid).
-HISTOGRAM_OPACITY = 0.8
+HISTOGRAM_OPACITY = 0.5
+# ---------------------------------------------------------------------------
+# CHART LEGEND ORDER CONSTANTS
+# ---------------------------------------------------------------------------
+
+# Lower numbers appear earlier in the legend.
+ACTUAL_PRICE_LEGENDRANK = 1
+MODEL_PRICE_LEGENDRANK = 2
+HISTOGRAM_LEGENDRANK = 30
