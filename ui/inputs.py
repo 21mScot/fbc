@@ -24,6 +24,8 @@ def get_user_inputs():
             help="Work with past (CSV) data or future projections.",
         )
 
+        st.markdown("---")
+        
         # ---------- Historical ----------
         st.markdown("### Historical data inputs")
         hist_disabled = mode != "Historical"
