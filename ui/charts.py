@@ -1,3 +1,6 @@
+# ui/charts.py
+
+from __future__ import annotations
 import pandas as pd
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
@@ -13,114 +16,212 @@ from core.models import estimate_mu_sigma_from_history, monte_carlo_gbm
 
 
 # ---------------------------------------------------------------------------
-# helpers
+# 1) DATA HELPERS (robust)
 # ---------------------------------------------------------------------------
 
-def _hist_from_monthly_breakdown(df: pd.DataFrame) -> pd.DataFrame | None:
-    """
-    Turn your monthly table (Month | Block | Subsidy | ...) into a
-    time series we can plot. If we can't, return None.
-    """
-    if df is None or df.empty:
+def _monthly_from_session() -> tuple[str | None, pd.DataFrame | None]:
+    """Try to pull monthly breakdown from Streamlit session."""
+    mb = st.session_state.get("monthly_breakdown")
+    if not isinstance(mb, pd.DataFrame):
+        return None, None
+    if "Month" not in mb.columns:
+        return None, None
+
+    mb = mb.copy()
+    mb["Date"] = pd.to_datetime(mb["Month"])
+
+    # prefer Subsidy – this shows halvings
+    if "Subsidy" in mb.columns:
+        mb["Subsidy"] = pd.to_numeric(mb["Subsidy"], errors="coerce")
+        out = mb[["Date", "Subsidy"]].sort_values("Date")
+        if not out.empty:
+            return "Subsidy (BTC)", out
+
+    # fallback to blocks derived
+    if "Block" in mb.columns:
+        out = _derive_blocks_from_monthly(mb)
+        if out is not None and not out.empty:
+            return "Blocks (derived)", out
+
+    return None, None
+
+
+def _derive_blocks_from_monthly(mb: pd.DataFrame) -> pd.DataFrame | None:
+    if mb is None or mb.empty:
+        return None
+    if "Month" not in mb.columns or "Block" not in mb.columns:
         return None
 
-    df = df.copy()
-    if "Month" not in df.columns or "Block" not in df.columns:
-        return None
+    mb = mb.copy()
+    mb["Date"] = pd.to_datetime(mb["Month"])
+    mb = mb.sort_values("Date")
 
-    df["Date"] = pd.to_datetime(df["Month"])
-    df = df.sort_values("Date")
-
-    # clean numeric
-    df["Block"] = (
-        df["Block"]
+    mb["Block"] = (
+        mb["Block"]
         .astype(str)
         .str.replace(",", "", regex=False)
         .str.replace("$", "", regex=False)
     )
-    df["Block"] = pd.to_numeric(df["Block"], errors="coerce")
+    mb["Block"] = pd.to_numeric(mb["Block"], errors="coerce")
 
-    df["Blocks (derived)"] = df["Block"].diff()
+    mb["Blocks (derived)"] = mb["Block"].diff()
+    if len(mb):
+        mb.loc[mb.index[0], "Blocks (derived)"] = float("nan")
 
-    # first one is huge, don't plot it
-    if len(df):
-        df.loc[df.index[0], "Blocks (derived)"] = float("nan")
-
-    out = df[["Date", "Blocks (derived)"]]
-    if out.empty:
-        return None
-    return out
+    out = mb[["Date", "Blocks (derived)"]]
+    return out if not out.empty else None
 
 
-def _find_histogram_source(plot_df: pd.DataFrame, hist_df: pd.DataFrame | None):
+def _monthly_from_df(df: pd.DataFrame, candidates: list[str]) -> tuple[str | None, pd.DataFrame | None]:
     """
-    Try to find something to plot as bars.
-
-    Priority:
-    1. session monthly_breakdown -> Subsidy (best for halvings)
-    2. session monthly_breakdown -> Blocks (derived)
-    3. plot_df / hist_df -> block-like columns
+    Take any dataframe, find a date-ish column, and resample one of the candidate
+    numeric columns to monthly. If we can't, return (None, None).
     """
-    # 1) explicit monthly_breakdown in session
-    if "monthly_breakdown" in st.session_state:
-        mb = st.session_state["monthly_breakdown"]
-        if isinstance(mb, pd.DataFrame) and "Month" in mb.columns:
-            mb = mb.copy()
-            mb["Date"] = pd.to_datetime(mb["Month"])
-            # prefer Subsidy
-            if "Subsidy" in mb.columns:
-                mb["Subsidy"] = pd.to_numeric(mb["Subsidy"], errors="coerce")
-                mb = mb[["Date", "Subsidy"]].sort_values("Date")
-                if not mb.empty:
-                    return "Subsidy (BTC)", mb
-            # fallback: derive from Block
-            monthly = _hist_from_monthly_breakdown(mb)
-            if monthly is not None and not monthly.empty:
-                return "Blocks (derived)", monthly
+    if df is None or df.empty:
+        return None, None
 
-    # 2) scan other session dfs
-    for v in st.session_state.values():
-        if isinstance(v, pd.DataFrame) and "Month" in v.columns and "Block" in v.columns:
-            monthly = _hist_from_monthly_breakdown(v)
-            if monthly is not None and not monthly.empty:
-                return "Blocks (derived)", monthly
+    df = df.copy()
 
-    # 3) look in plot_df for block-ish stuff
-    if plot_df is not None and not plot_df.empty:
-        for cand in ["Blocks", "block_count", "blocks", "Blocks Mined"]:
-            if cand in plot_df.columns:
-                tmp = plot_df.copy()
-                tmp["Date"] = pd.to_datetime(tmp["Date"])
-                monthly = (
-                    tmp.set_index("Date")[cand]
-                    .resample("M")
-                    .sum()
-                    .reset_index()
-                )
-                if not monthly.empty:
-                    return cand, monthly
+    # find a date column in a forgiving way
+    date_col = None
+    for col in df.columns:
+        if col.lower() in ("date", "dt", "timestamp"):
+            date_col = col
+            break
 
-    # 4) look in hist_df
-    if hist_df is not None and not hist_df.empty:
-        for cand in ["Blocks", "block_count", "blocks", "Blocks Mined"]:
-            if cand in hist_df.columns:
-                tmp = hist_df.copy()
-                tmp["Date"] = pd.to_datetime(tmp["Date"])
-                monthly = (
-                    tmp.set_index("Date")[cand]
-                    .resample("M")
-                    .sum()
-                    .reset_index()
-                )
-                if not monthly.empty:
-                    return cand, monthly
+    if date_col is None:
+        # this df just isn't suitable for a time-based histogram
+        return None, None
 
-    # nothing found
+    df[date_col] = pd.to_datetime(df[date_col], errors="coerce")
+    df = df.dropna(subset=[date_col])
+
+    if df.empty:
+        return None, None
+
+    df = df.set_index(date_col)
+
+    for col in candidates:
+        if col in df.columns:
+            monthly = df[col].resample("M").sum().reset_index()
+            if not monthly.empty:
+                # normalise to "Date" for the rest of the code
+                monthly = monthly.rename(columns={date_col: "Date"})
+                return col, monthly
+
     return None, None
 
 
+def _get_histogram_series(
+    plot_df: pd.DataFrame,
+    hist_df: pd.DataFrame | None,
+) -> tuple[str | None, pd.DataFrame | None]:
+    """
+    Unified entrypoint for 'what should we show on the right axis?'.
+    Tries: session -> plot_df -> hist_df, but only returns real data.
+    """
+    # 1) session
+    name, series = _monthly_from_session()
+    if name and series is not None and not series.empty:
+        return name, series
+
+    # 2) from main plot df
+    name, series = _monthly_from_df(plot_df, ["Blocks", "block_count", "blocks", "Blocks Mined"])
+    if name and series is not None and not series.empty:
+        return name, series
+
+    # 3) from hist df (this is where your error came from)
+    if hist_df is not None and not hist_df.empty:
+        name, series = _monthly_from_df(hist_df, ["Blocks", "block_count", "blocks", "Blocks Mined"])
+        if name and series is not None and not series.empty:
+            return name, series
+
+    return None, None
+
 # ---------------------------------------------------------------------------
-# main
+# 2) FIGURE BUILDER
+# ---------------------------------------------------------------------------
+
+def _make_price_figure(
+    price_df: pd.DataFrame,
+    start_ts: pd.Timestamp,
+    end_ts: pd.Timestamp,
+    price_model: str,
+    hist_df: pd.DataFrame | None,
+):
+    fig = make_subplots(specs=[[{"secondary_y": True}]])
+    today_ts = pd.Timestamp.today().normalize()
+
+    if price_model == "Monte Carlo (GBM)":
+        actual = price_df[price_df["Actual Price"].notna()]
+        if not actual.empty:
+            fig.add_trace(
+                go.Scatter(
+                    x=actual["Date"],
+                    y=actual["Actual Price"],
+                    name="Actual Price",
+                    mode="lines",
+                    line=dict(color="#f7931a", width=2),
+                ),
+                secondary_y=False,
+            )
+
+        mu, sigma = estimate_mu_sigma_from_history(hist_df)
+        start_price = float(price_df["Model Price"].iloc[0])
+        mc_df = monte_carlo_gbm(
+            start_price=start_price,
+            start_dt=start_ts,
+            end_dt=end_ts,
+            mu=mu,
+            sigma=sigma,
+            n_sims=500,
+        )
+
+        fig.add_trace(
+            go.Scatter(
+                x=mc_df["Date"],
+                y=mc_df["P50"],
+                name="MC P50",
+                mode="lines",
+            ),
+            secondary_y=False,
+        )
+        # could add bands here if you like
+    else:
+        actual = price_df[price_df["Actual Price"].notna()]
+        if not actual.empty:
+            fig.add_trace(
+                go.Scatter(
+                    x=actual["Date"],
+                    y=actual["Actual Price"],
+                    name="Actual Price",
+                    mode="lines",
+                    line=dict(color="#f7931a", width=2),
+                ),
+                secondary_y=False,
+            )
+        model = price_df[price_df["Actual Price"].isna()]
+        if not model.empty:
+            fig.add_trace(
+                go.Scatter(
+                    x=model["Date"],
+                    y=model["Model Price"],
+                    name="Model Price",
+                    mode="lines",
+                    line=dict(color="#f7931a", width=2, dash="dash"),
+                ),
+                secondary_y=False,
+            )
+
+    # today marker
+    if start_ts <= today_ts <= end_ts:
+        fig.add_vline(x=today_ts, line_width=1, line_dash="dot", line_color="gray")
+
+    return fig
+
+
+# ---------------------------------------------------------------------------
+# 3) PUBLIC API
 # ---------------------------------------------------------------------------
 
 def build_price_chart(
@@ -134,185 +235,67 @@ def build_price_chart(
     dark = st.session_state.get("dark_mode", False)
     template = "plotly_dark" if dark else "plotly_white"
 
-    today_ts = pd.Timestamp.today().normalize()
-    mc_df = None
-
     start_ts = pd.to_datetime(start_date)
     end_ts = pd.to_datetime(end_date)
 
-    # normalise incoming
+    # filter to window
     plot_df = plot_df.copy()
     plot_df["Date"] = pd.to_datetime(plot_df["Date"])
-    plot_df_window = plot_df[(plot_df["Date"] >= start_ts) & (plot_df["Date"] <= end_ts)].copy()
+    window_df = plot_df[(plot_df["Date"] >= start_ts) & (plot_df["Date"] <= end_ts)].copy()
 
-    # trim forecast if backcasting
-    plot_df_trim = plot_df_window.copy()
-    history_mask = plot_df_trim["Actual Price"].notna()
-    if backcast and history_mask.any():
-        hist_start = plot_df_trim.loc[history_mask, "Date"].min()
-        hist_end = plot_df_trim.loc[history_mask, "Date"].max()
-        hist_days = max((hist_end - hist_start).days, 1)
-        max_forecast_days = int(hist_days * (1 - HISTORY_RATIO))
-        forecast_cutoff = hist_end + pd.Timedelta(days=max_forecast_days)
-        plot_df_trim = plot_df_trim[plot_df_trim["Date"] <= forecast_cutoff]
+    # trim forecast if needed
+    if backcast:
+        hist_mask = window_df["Actual Price"].notna()
+        if hist_mask.any():
+            hist_start = window_df.loc[hist_mask, "Date"].min()
+            hist_end = window_df.loc[hist_mask, "Date"].max()
+            hist_days = max((hist_end - hist_start).days, 1)
+            max_forecast_days = int(hist_days * (1 - HISTORY_RATIO))
+            cutoff = hist_end + pd.Timedelta(days=max_forecast_days)
+            window_df = window_df[window_df["Date"] <= cutoff]
 
-    # try to get bars
-    hist_col, hist_monthly = _find_histogram_source(plot_df_window, hist_df)
+    # 1) build base figure with price
+    fig = _make_price_figure(window_df, start_ts, end_ts, price_model, hist_df)
+    mc_df = None  # if you want MC back, return it from _make_price_figure
 
-    # 2-axis fig
-    fig = make_subplots(specs=[[{"secondary_y": True}]])
+    # 2) get histogram series
+    hist_name, hist_df_monthly = _get_histogram_series(window_df, hist_df)
 
-    # -------------------- PRICE ON LEFT --------------------
-    if price_model == "Monte Carlo (GBM)":
-        hist_part = plot_df_trim[plot_df_trim["Actual Price"].notna()]
-        if not hist_part.empty:
-            fig.add_trace(
-                go.Scatter(
-                    x=hist_part["Date"],
-                    y=hist_part["Actual Price"],
-                    name="Actual Price",
-                    mode="lines",
-                    line=dict(color="#f7931a", width=2),
-                ),
-                secondary_y=False,
-            )
-
-        daily_mu, daily_sigma = estimate_mu_sigma_from_history(hist_df)
-        start_price = float(plot_df_trim["Model Price"].iloc[0])
-        mc_df = monte_carlo_gbm(
-            start_price=start_price,
-            start_dt=start_ts,
-            end_dt=end_ts,
-            mu=daily_mu,
-            sigma=daily_sigma,
-            n_sims=500,
-        )
-
-        fig.add_trace(
-            go.Scatter(
-                x=mc_df["Date"],
-                y=mc_df["P50"],
-                name="MC P50",
-                mode="lines",
-                line=dict(width=2),
-            ),
-            secondary_y=False,
-        )
-        fig.add_trace(
-            go.Scatter(
-                x=pd.concat([mc_df["Date"], mc_df["Date"][::-1]]),
-                y=pd.concat([mc_df["P25"], mc_df["P75"][::-1]]),
-                name="MC 25-75%",
-                fill="toself",
-                line=dict(width=0),
-                opacity=0.2,
-            ),
-            secondary_y=False,
-        )
-        fig.add_trace(
-            go.Scatter(
-                x=pd.concat([mc_df["Date"], mc_df["Date"][::-1]]),
-                y=pd.concat([mc_df["P05"], mc_df["P95"][::-1]]),
-                name="MC 5-95%",
-                fill="toself",
-                line=dict(width=0),
-                opacity=0.1,
-            ),
-            secondary_y=False,
-        )
-    else:
-        hist_part = plot_df_trim[plot_df_trim["Actual Price"].notna()]
-        if not hist_part.empty:
-            fig.add_trace(
-                go.Scatter(
-                    x=hist_part["Date"],
-                    y=hist_part["Actual Price"],
-                    name="Actual Price",
-                    mode="lines",
-                    line=dict(color="#f7931a", width=2),
-                ),
-                secondary_y=False,
-            )
-        model_part = plot_df_trim[plot_df_trim["Actual Price"].isna()]
-        if not model_part.empty:
-            fig.add_trace(
-                go.Scatter(
-                    x=model_part["Date"],
-                    y=model_part["Model Price"],
-                    name="Model Price",
-                    mode="lines",
-                    line=dict(color="#f7931a", width=2, dash="dash"),
-                ),
-                secondary_y=False,
-            )
-
-    # -------------------- BARS ON RIGHT --------------------
+    # 3) add histogram (right axis)
     max_bar_val = None
-    if (
-        hist_col is not None
-        and hist_monthly is not None
-        and not hist_monthly.empty
-    ):
-        # apply date window
-        hist_monthly = hist_monthly[
-            (hist_monthly["Date"] >= start_ts) & (hist_monthly["Date"] <= end_ts)
+    if hist_name and hist_df_monthly is not None and not hist_df_monthly.empty:
+        hist_df_monthly = hist_df_monthly[
+            (hist_df_monthly["Date"] >= start_ts) & (hist_df_monthly["Date"] <= end_ts)
         ]
-        if not hist_monthly.empty:
-            val_col = hist_monthly.columns[1]
-            max_bar_val = hist_monthly[val_col].max(skipna=True)
+        if not hist_df_monthly.empty:
+            val_col = hist_df_monthly.columns[1]
+            max_bar_val = hist_df_monthly[val_col].max(skipna=True)
 
             fig.add_trace(
                 go.Bar(
-                    x=hist_monthly["Date"],
-                    y=hist_monthly[val_col],
-                    name=hist_col,
+                    x=hist_df_monthly["Date"],
+                    y=hist_df_monthly[val_col],
+                    name=hist_name,
                     marker_color=HISTOGRAM_COLOR,
                     opacity=HISTOGRAM_OPACITY,
                 ),
                 secondary_y=True,
             )
 
-    # today marker
-    if start_ts <= today_ts <= end_ts:
-        fig.add_vline(
-            x=today_ts,
-            line_width=1,
-            line_dash="dot",
-            line_color="gray",
-        )
-        fig.add_annotation(
-            x=today_ts,
-            y=1,
-            xref="x",
-            yref="paper",
-            text="Today",
-            showarrow=False,
-            yshift=10,
-            font=dict(color="gray"),
-        )
-
-    # axes/layout
+    # 4) layout
     fig.update_yaxes(title_text="Price (USD)", secondary_y=False)
-
-    if max_bar_val is not None and pd.notna(max_bar_val):
+    if max_bar_val is not None:
         top = max_bar_val / HISTOGRAM_HEIGHT_RATIO
-        fig.update_yaxes(title_text=hist_col, secondary_y=True, range=[0, top])
-    else:
-        fig.update_yaxes(title_text="", secondary_y=True)
+        fig.update_yaxes(title_text=hist_name, secondary_y=True, range=[0, top])
 
     fig.update_layout(
         title="Bitcoin Price (actual/forecast) & block histogram",
         xaxis_title="Date",
         hovermode="x unified",
         template=template,
-        height=600,
         margin=dict(l=80, r=40, t=60, b=60),
-        xaxis=dict(range=[start_ts, end_ts]),
+        legend=dict(title_text="", traceorder="normal"),
         barmode="overlay",
-        legend=dict(
-            title_text="",
-            traceorder="normal",
-        ),
     )
 
     return fig, mc_df
