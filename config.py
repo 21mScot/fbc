@@ -18,3 +18,15 @@ LATEST_TO_DATE     = date(2025, 11, 1)    # 1 November 2025
 
 # how much of the chart should be history vs forecast
 HISTORY_RATIO = 0.85   # show ~85% history and 15% forecast
+# ---------------------------------------------------------------------------
+# CHART STYLE CONSTANTS
+# ---------------------------------------------------------------------------
+
+# Controls how tall the tallest histogram bar appears relative to its axis.
+HISTOGRAM_HEIGHT_RATIO = 0.6   # e.g. 0.8 = top bar reaches 80% of right axis
+
+# Controls the bar colour for the histogram (any Plotly-compatible colour string).
+HISTOGRAM_COLOR = "rgba(128,128,128,0.5)"  # semi-transparent light grey
+
+# Controls how opaque the histogram bars are (0 = fully transparent, 1 = solid).
+HISTOGRAM_OPACITY = 0.8

@@ -106,7 +106,7 @@ with c4:
 with c5:
     st.metric("Value at Current Price", f"${usd_value:,.0f}")
 
-# 6) chart
+# 6) chart (first pass - get mc_df)
 fig, mc_df = build_price_chart(
     plot_df=plot_df,
     start_date=start_dt,
@@ -115,9 +115,8 @@ fig, mc_df = build_price_chart(
     price_model=price_model,
     hist_df=hist_df,
 )
-st.plotly_chart(fig, width="stretch")
 
-# 7) monthly breakdown
+# 7) monthly breakdown (needs mc_df)
 df_monthly = build_monthly_table(
     start_dt=start_dt,
     end_dt=end_dt,
@@ -127,18 +126,38 @@ df_monthly = build_monthly_table(
     current_fee=current_fee,
     fee_growth=fee_growth,
 )
+
+# make it available to charts.py
+st.session_state["monthly_breakdown"] = df_monthly
+
+# 6b) chart (second pass - now histogram is possible)
+fig, _ = build_price_chart(
+    plot_df=plot_df,
+    start_date=start_dt,
+    end_date=end_dt,
+    backcast=backcast,
+    price_model=price_model,
+    hist_df=hist_df,
+)
+
+st.plotly_chart(fig, width="stretch")
+
+# 8) show table
 st.subheader("Monthly Breakdown")
 st.dataframe(
-    df_monthly.style.format({
-        "Subsidy": "{:.6f}",
-        "Est. Fee": "{:.6f}",
-        "Price": "${:,.0f}",
-    }),
+    df_monthly.style.format(
+        {
+            "Subsidy": "{:.6f}",
+            "Est. Fee": "{:.6f}",
+            "Price": "${:,.0f}",
+        }
+    ),
     width="stretch",
 )
 
 csv = df_monthly.to_csv(index=False).encode()
 st.download_button("Download CSV", csv, "future_bitcoin_forecast.csv", "text/csv")
+
 
 # 8) footer
 st.markdown("---")
