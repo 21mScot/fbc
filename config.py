@@ -1,0 +1,20 @@
+from datetime import datetime, date
+
+GENESIS = datetime(2009, 1, 3, 18, 15, 5)
+BLOCK_TIME = 588
+SATOSHIS = 100_000_000
+HALVING = 210_000
+FEE_API = "https://mempool.space/api/v1/blocks"
+PRICE_API = "https://blockchain.info/ticker"
+EARLIEST_DATA = datetime(2017, 8, 17).date()
+NUMBER_DAYS_SEPARATION_BTWN_DATES = 180
+
+# date bounds for historical CSV
+EARLIEST_FROM_DATE = date(2017, 7, 1)     # 1 July 2017
+LATEST_FROM_DATE   = date(2025, 10, 1)    # 1 October 2025
+
+EARLIEST_TO_DATE   = date(2018, 1, 1)     # 1 January 2018
+LATEST_TO_DATE     = date(2025, 11, 1)    # 1 November 2025
+
+# how much of the chart should be history vs forecast
+HISTORY_RATIO = 0.85   # show ~85% history and 15% forecast
