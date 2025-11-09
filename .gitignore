@@ -1,5 +1,6 @@
 # --- Python / FastAPI standard ignores ---
 __pycache__/
+*.pyc
 *.py[cod]
 *.pyo
 *.pyd
