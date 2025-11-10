@@ -22,25 +22,36 @@ LATEST_FROM_DATE   = date(2025, 10, 1)    # 1 October 2025
 EARLIEST_TO_DATE   = date(2018, 1, 1)     # 1 January 2018
 LATEST_TO_DATE     = date(2025, 11, 1)    # 1 November 2025
 
-# x-axis, how much of the chart should be history vs forecast - 8 years of historical data - forcast 4?
+# x-axis, how much of the chart should be history vs forecast
 HISTORY_RATIO = 0.85   # show ~85% history and 15% forecast
+
 # ---------------------------------------------------------------------------
 # CHART STYLE CONSTANTS
 # ---------------------------------------------------------------------------
 
-# y-asix, Controls how tall the tallest histogram bar appears relative to its axis.
+# Controls how tall the tallest histogram bar appears relative to its axis.
 HISTOGRAM_HEIGHT_RATIO = 0.6   # e.g. 0.8 = top bar reaches 80% of right axis
 
 # Controls the bar colour for the histogram (any Plotly-compatible colour string).
 HISTOGRAM_COLOR = "rgba(128,128,128,0.5)"  # semi-transparent light grey
-# what about fixing
-ACTUAL_PRICE_COLOR = "ORANGE"
-MODEL_PRICE_COLOR="ORANGE"
-ACTUAL_PRICE_LINESTYLE = "SOLID"
-MODEL_PRICE_LINESTYLE = "BROKEN"
+
+# --- price line styles (for ui/charts.py) ---
+# Bitcoin orange for actual
+ACTUAL_PRICE_COLOR = "#f7931a"
+# slightly lighter/or warmer for model so they’re distinguishable
+MODEL_PRICE_COLOR = "#ffb347"
+
+# Plotly dash options: "solid", "dash", "dot", "dashdot"
+ACTUAL_PRICE_LINESTYLE = "solid"
+MODEL_PRICE_LINESTYLE = "dash"
+
+# widths (kept as constants so you can tweak globally)
+ACTUAL_PRICE_LINEWIDTH = 2
+MODEL_PRICE_LINEWIDTH = 2
 
 # Controls how opaque the histogram bars are (0 = fully transparent, 1 = solid).
 HISTOGRAM_OPACITY = 0.5
+
 # ---------------------------------------------------------------------------
 # CHART LEGEND ORDER CONSTANTS
 # ---------------------------------------------------------------------------
@@ -49,7 +60,3 @@ HISTOGRAM_OPACITY = 0.5
 ACTUAL_PRICE_LEGENDRANK = 1
 MODEL_PRICE_LEGENDRANK = 2
 HISTOGRAM_LEGENDRANK = 30
-
-# what about fixing
-ACTUAL_PRICE_COLOR = "ORGANGE"
-MODEL_PRICE_COLOR="ORANGE"
