@@ -13,6 +13,13 @@ from config import (
     ACTUAL_PRICE_LEGENDRANK,
     MODEL_PRICE_LEGENDRANK,
     HISTOGRAM_LEGENDRANK,
+    # 👇 new imports from config.py
+    ACTUAL_PRICE_COLOR,
+    MODEL_PRICE_COLOR,
+    ACTUAL_PRICE_LINESTYLE,
+    MODEL_PRICE_LINESTYLE,
+    ACTUAL_PRICE_LINEWIDTH,
+    MODEL_PRICE_LINEWIDTH,
 )
 from core.models import estimate_mu_sigma_from_history, monte_carlo_gbm
 
@@ -20,6 +27,7 @@ from core.models import estimate_mu_sigma_from_history, monte_carlo_gbm
 # ---------- helpers ----------
 
 def _derive_blocks_from_monthly(mb: pd.DataFrame) -> pd.DataFrame | None:
+    """fallback: compute block deltas from the monthly table already in session"""
     if mb is None or mb.empty:
         return None
     if "Month" not in mb.columns or "Block" not in mb.columns:
@@ -46,6 +54,7 @@ def _derive_blocks_from_monthly(mb: pd.DataFrame) -> pd.DataFrame | None:
 
 
 def _monthly_from_session() -> tuple[str | None, pd.DataFrame | None]:
+    """try to get the monthly breakdown the app already computed"""
     mb = st.session_state.get("monthly_breakdown")
     if not isinstance(mb, pd.DataFrame):
         return None, None
@@ -55,14 +64,14 @@ def _monthly_from_session() -> tuple[str | None, pd.DataFrame | None]:
     mb = mb.copy()
     mb["Date"] = pd.to_datetime(mb["Month"])
 
-    # best: subsidy (shows halvings)
+    # prefer subsidy because it shows halvings
     if "Subsidy" in mb.columns:
         mb["Subsidy"] = pd.to_numeric(mb["Subsidy"], errors="coerce")
         out = mb[["Date", "Subsidy"]].sort_values("Date")
         if not out.empty:
             return "Subsidy (BTC)", out
 
-    # fallback: blocks derived
+    # fallback: blocks
     out = _derive_blocks_from_monthly(mb)
     if out is not None:
         return "Blocks (derived)", out
@@ -71,6 +80,7 @@ def _monthly_from_session() -> tuple[str | None, pd.DataFrame | None]:
 
 
 def _monthly_from_df(df: pd.DataFrame, candidates: list[str]) -> tuple[str | None, pd.DataFrame | None]:
+    """resample any df we have (plot_df / hist_df) to monthly."""
     if df is None or df.empty:
         return None, None
 
@@ -103,23 +113,89 @@ def _monthly_from_df(df: pd.DataFrame, candidates: list[str]) -> tuple[str | Non
 
 
 def _get_histogram_series(plot_df: pd.DataFrame, hist_df: pd.DataFrame | None):
-    # 1) session
+    """unified way to get the monthly series the histogram should show"""
+    # 1) from session/monthly breakdown
     name, series = _monthly_from_session()
     if name and series is not None and not series.empty:
         return name, series
 
-    # 2) plot df
+    # 2) from plot df
     name, series = _monthly_from_df(plot_df, ["Blocks", "block_count", "blocks", "Blocks Mined"])
     if name and series is not None and not series.empty:
         return name, series
 
-    # 3) hist df
+    # 3) from historical df
     if hist_df is not None and not hist_df.empty:
         name, series = _monthly_from_df(hist_df, ["Blocks", "block_count", "blocks", "Blocks Mined"])
         if name and series is not None and not series.empty:
             return name, series
 
     return None, None
+
+
+def _bar_centers_from_starts(starts: list[pd.Timestamp]) -> list[pd.Timestamp]:
+    """
+    given month start dates, return centers;
+    for the last one, stay clearly inside the bar (half gap - 2 days)
+    """
+    centers: list[pd.Timestamp] = []
+    if not starts:
+        return centers
+
+    for i, s in enumerate(starts):
+        if i < len(starts) - 1:
+            nxt = starts[i + 1]
+            centers.append(s + (nxt - s) / 2)
+        else:
+            # last bar: use previous gap, but pull it a bit left so it doesn't hug the edge
+            if len(starts) > 1:
+                gap = starts[i] - starts[i - 1]
+                center = s + gap / 2 - pd.Timedelta(days=2)
+                centers.append(center)
+            else:
+                centers.append(s + pd.Timedelta(days=15))
+    return centers
+
+
+def _pick_price_per_bar(
+    window_df: pd.DataFrame,
+    bar_starts: list[pd.Timestamp],
+    end_ts: pd.Timestamp,
+) -> list[float | None]:
+    """
+    For each bar (month) look at the actual windowed price data in that exact span
+    and take the *last* price we have (Actual preferred, else Model).
+    """
+    out: list[float | None] = []
+
+    df = window_df.copy()
+    df["Date"] = pd.to_datetime(df["Date"])
+
+    for i, start in enumerate(bar_starts):
+        if i < len(bar_starts) - 1:
+            stop = bar_starts[i + 1]
+        else:
+            stop = end_ts + pd.Timedelta(days=1)
+
+        span = df[(df["Date"] >= start) & (df["Date"] < stop)].sort_values("Date")
+
+        if span.empty:
+            out.append(None)
+            continue
+
+        # prefer actual
+        actual = span["Actual Price"].dropna()
+        if not actual.empty:
+            out.append(float(actual.iloc[-1]))
+            continue
+
+        model = span["Model Price"].dropna()
+        if not model.empty:
+            out.append(float(model.iloc[-1]))
+        else:
+            out.append(None)
+
+    return out
 
 
 # ---------- main entrypoint ----------
@@ -160,27 +236,32 @@ def build_price_chart(
             cutoff = hist_end + pd.Timedelta(days=max_forecast_days)
             window_df = window_df[window_df["Date"] <= cutoff]
 
-    # prepare price dfs ONCE
-    actual = window_df[window_df["Actual Price"].notna()]
-    model = window_df[window_df["Actual Price"].isna()]
-
-    # get histogram series (may be None)
+    # histogram series
     hist_name, hist_df_monthly = _get_histogram_series(window_df, hist_df)
 
-    # figure
     fig = make_subplots(specs=[[{"secondary_y": True}]])
-
-    # 1) draw histogram FIRST (so lines overlay)
     max_bar_val = None
+    bar_starts: list[pd.Timestamp] = []
+    bar_centers: list[pd.Timestamp] = []
+
+    # 1) histogram (bars)
     if (
         hist_name is not None
         and hist_df_monthly is not None
         and not hist_df_monthly.empty
     ):
-        hist_df_monthly = hist_df_monthly[
-            (hist_df_monthly["Date"] >= start_ts) & (hist_df_monthly["Date"] <= end_ts)
-        ]
+        hist_df_monthly = (
+            hist_df_monthly[
+                (hist_df_monthly["Date"] >= start_ts)
+                & (hist_df_monthly["Date"] <= end_ts)
+            ]
+            .sort_values("Date")
+        )
+
         if not hist_df_monthly.empty:
+            bar_starts = hist_df_monthly["Date"].tolist()
+            bar_centers = _bar_centers_from_starts(bar_starts)
+
             val_col = hist_df_monthly.columns[1]
             max_bar_val = hist_df_monthly[val_col].max(skipna=True)
 
@@ -196,29 +277,38 @@ def build_price_chart(
                 secondary_y=True,
             )
 
-    # 2) add price lines ONCE, in the order you want
-    if not actual.empty:
-        fig.add_trace(
-            go.Scatter(
-                x=actual["Date"],
-                y=actual["Actual Price"],
-                name="Actual Price",
-                mode="lines",
-                line=dict(color="#f7931a", width=2),
-                legendrank=ACTUAL_PRICE_LEGENDRANK,
-            ),
-            secondary_y=False,
-        )
+    # 2) price line — 1 price per bar
+    if bar_starts:
+        prices_per_bar = _pick_price_per_bar(window_df, bar_starts, end_ts)
 
-    if not model.empty:
+        # decide which style to use
+        has_any_actual = window_df["Actual Price"].notna().any()
+        if has_any_actual:
+            line_color = ACTUAL_PRICE_COLOR
+            line_width = ACTUAL_PRICE_LINEWIDTH
+            line_dash = ACTUAL_PRICE_LINESTYLE
+            line_name = "Actual Price"
+            legend_rank = ACTUAL_PRICE_LEGENDRANK
+        else:
+            line_color = MODEL_PRICE_COLOR
+            line_width = MODEL_PRICE_LINEWIDTH
+            line_dash = MODEL_PRICE_LINESTYLE
+            line_name = "Model Price"
+            legend_rank = MODEL_PRICE_LEGENDRANK
+
         fig.add_trace(
             go.Scatter(
-                x=model["Date"],
-                y=model["Model Price"],
-                name="Model Price",
+                x=bar_centers,
+                y=prices_per_bar,
+                name=line_name,
                 mode="lines",
-                line=dict(color="#f7931a", width=2, dash="dash"),
-                legendrank=MODEL_PRICE_LEGENDRANK,
+                line=dict(
+                    color=line_color,
+                    width=line_width,
+                    dash=line_dash,
+                ),
+                connectgaps=False,
+                legendrank=legend_rank,
             ),
             secondary_y=False,
         )
@@ -241,16 +331,17 @@ def build_price_chart(
             xanchor="right",
         )
 
-    # axes
+    # y-axes
     fig.update_yaxes(title_text="Price (USD)", secondary_y=False)
-
     if max_bar_val is not None:
         top = max_bar_val / HISTOGRAM_HEIGHT_RATIO
         fig.update_yaxes(title_text=hist_name, secondary_y=True, range=[0, top])
     else:
         fig.update_yaxes(title_text="", secondary_y=True)
 
-    # layout
+    # pad x so first bar isn't cut
+    axis_start = start_ts - pd.Timedelta(days=15)
+
     fig.update_layout(
         title="Bitcoin Price (actual/forecast) & block histogram",
         xaxis_title="Date",
@@ -258,7 +349,7 @@ def build_price_chart(
         template=template,
         height=600,
         margin=dict(l=80, r=40, t=60, b=60),
-        xaxis=dict(range=[start_ts, end_ts]),
+        xaxis=dict(range=[axis_start, end_ts]),
         barmode="overlay",
         legend=dict(
             title_text="Key",
